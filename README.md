@@ -1,4 +1,4 @@
-# localLangchineStack
+# localLangChainStack
 
 A local Docker Compose deployment of a LangGraph agent using LangChain's Ollama
 integration. It exposes an A2A 1.0 JSON-RPC agent for RealityEngine dispatchers.
