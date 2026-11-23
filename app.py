@@ -1,6 +1,9 @@
 import asyncio
+import contextlib
 import logging
 import os
+import sqlite3
+from pathlib import Path
 from typing import TypedDict
 
 from a2a.server.agent_execution import AgentExecutor, RequestContext
@@ -8,7 +11,7 @@ from a2a.server.events import EventQueue
 from a2a.server.request_handlers.default_request_handler_v2 import DefaultRequestHandlerV2
 from a2a.server.routes.agent_card_routes import create_agent_card_routes
 from a2a.server.routes.jsonrpc_routes import create_jsonrpc_routes
-from a2a.server.tasks import InMemoryTaskStore, TaskUpdater
+from a2a.server.tasks import DatabaseTaskStore, TaskUpdater
 from a2a.types.a2a_pb2 import (
     AgentCapabilities,
     AgentCard,
@@ -19,8 +22,11 @@ from a2a.types.a2a_pb2 import (
     TaskState,
     TaskStatus,
 )
+from google.protobuf.json_format import MessageToDict
 from langchain_ollama import ChatOllama
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.graph import END, START, StateGraph
+from sqlalchemy.ext.asyncio import create_async_engine
 from starlette.applications import Starlette
 from starlette.responses import JSONResponse
 from starlette.routing import Route
@@ -59,10 +65,105 @@ builder = StateGraph(GraphState)
 builder.add_node("respond", respond)
 builder.add_edge(START, "respond")
 builder.add_edge("respond", END)
+# Compiled without a checkpointer for direct use; Runtime.start() compiles the
+# served graph with the persistent one.
 graph = builder.compile()
+
+# The RealityEngine A2A extension (RealityEngine_CI docs/A2A_FRAMEWORK_SPEC.md
+# section 6, still a draft: CI#848). Only the members this service needs to key
+# its state are read here. Carrying the extension exactly is #6.
+# The extension's identifier is the URL of its published specification, pinned
+# to the version tag (spec section 6.1, owner 2026-11-23). It is a constant,
+# compared as a string, never fetched.
+RE_EXTENSION_URI = "https://github.com/jateeter/RealityEngine_CI/blob/re-a2a-v0.1/docs/A2A_FRAMEWORK_SPEC.md"
+
+
+def re_extension(context: RequestContext) -> dict:
+    """The RealityEngine extension object from the message metadata, or {}."""
+    message = context.message
+    if message is None or not message.HasField("metadata"):
+        return {}
+    value = MessageToDict(message.metadata).get(RE_EXTENSION_URI)
+    return value if isinstance(value, dict) else {}
+
+
+def thread_id_for(context: RequestContext) -> str:
+    """The LangGraph thread for a request (the resource model, #2).
+
+    The thread is the dispatch's context (spec section 4.5, owner 2026-11-23):
+    the workflow's context scope (frame, continuation, span or dispatch) sets
+    its lifetime, so one thread serves one step, travels with a continuation,
+    or spans frames, as configured. The id comes from the extension's
+    `context.contextId`, never from a context id this server minted. Without
+    the extension (a manual request), the A2A context id is used.
+    """
+    context_id = (re_extension(context).get("context") or {}).get("contextId")
+    return context_id or context.context_id
+
+
+def dispatch_id_for(context: RequestContext) -> str | None:
+    return (re_extension(context).get("dispatch") or {}).get("dispatchId")
+
+
+class Runtime:
+    """Persistent state: the A2A task store, the LangGraph checkpointer and the
+    dispatch index. Everything lives under RE_LANGSTACK_STATE_DIR and survives a
+    restart (#4)."""
+
+    def __init__(self, state_dir: str | os.PathLike):
+        # Nothing touches the filesystem until start(): importing this module
+        # must not need the state directory.
+        self.state_dir = Path(state_dir)
+        self.engine = create_async_engine(f"sqlite+aiosqlite:///{self.state_dir / 'tasks.sqlite'}")
+        self.task_store = DatabaseTaskStore(self.engine)
+        self.graph = None
+        self._stack: contextlib.AsyncExitStack | None = None
+        self._index: sqlite3.Connection | None = None
+
+    async def start(self) -> None:
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        self._index = sqlite3.connect(self.state_dir / "dispatches.sqlite", check_same_thread=False)
+        self._index.execute(
+            "CREATE TABLE IF NOT EXISTS dispatches (dispatch_id TEXT PRIMARY KEY, task_id TEXT NOT NULL)"
+        )
+        self._index.commit()
+        self._stack = contextlib.AsyncExitStack()
+        saver = await self._stack.enter_async_context(
+            AsyncSqliteSaver.from_conn_string(str(self.state_dir / "checkpoints.sqlite"))
+        )
+        self.graph = builder.compile(checkpointer=saver)
+        await self.task_store.initialize()
+
+    async def stop(self) -> None:
+        if self._stack is not None:
+            await self._stack.aclose()
+            self._stack = None
+        self.graph = None
+        if self._index is not None:
+            self._index.close()
+            self._index = None
+        await self.engine.dispose()
+
+    def claim_dispatch(self, dispatch_id: str, task_id: str) -> str | None:
+        """Record dispatch_id -> task_id once. Returns the task that already holds
+        the dispatch, or None when this task now holds it."""
+        try:
+            with self._index:
+                self._index.execute(
+                    "INSERT INTO dispatches (dispatch_id, task_id) VALUES (?, ?)", (dispatch_id, task_id)
+                )
+            return None
+        except sqlite3.IntegrityError:
+            row = self._index.execute(
+                "SELECT task_id FROM dispatches WHERE dispatch_id = ?", (dispatch_id,)
+            ).fetchone()
+            return row[0] if row else None
 
 
 class GraphExecutor(AgentExecutor):
+    def __init__(self, runtime: Runtime):
+        self.runtime = runtime
+
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
         task_id, context_id = context.task_id, context.context_id
         updater = TaskUpdater(event_queue, task_id, context_id)
@@ -81,10 +182,22 @@ class GraphExecutor(AgentExecutor):
         ) or not context.get_user_input().strip():
             await updater.reject(updater.new_agent_message([Part(text="Only non-empty text messages are supported.")]))
             return
+        dispatch_id = dispatch_id_for(context)
+        if dispatch_id:
+            holder = self.runtime.claim_dispatch(dispatch_id, task_id)
+            if holder is not None and holder != task_id:
+                # Once-only by dispatchId: a second request is never re-run.
+                await updater.reject(
+                    updater.new_agent_message([Part(text=f"Duplicate dispatch {dispatch_id}: task {holder}.")])
+                )
+                return
         await updater.start_work()
         try:
             result = await asyncio.wait_for(
-                graph.ainvoke({"prompt": context.get_user_input()}),
+                self.runtime.graph.ainvoke(
+                    {"prompt": context.get_user_input()},
+                    {"configurable": {"thread_id": thread_id_for(context)}},
+                ),
                 timeout=float(os.getenv("MODEL_TIMEOUT_SECONDS", "120")),
             )
             await updater.add_artifact([Part(text=result["response"])], name="response")
@@ -110,17 +223,34 @@ card = AgentCard(
     default_output_modes=["text/plain"],
     skills=[AgentSkill(id="respond", name="Respond", description="Respond to a text message.", tags=["chat"])],
 )
-handler = DefaultRequestHandlerV2(
-    agent_executor=GraphExecutor(), task_store=InMemoryTaskStore(), agent_card=card
-)
-
-
 async def health(request):
     return JSONResponse({"status": "ok"})
 
 
-app = Starlette(routes=[
-    Route("/healthz", health),
-    *create_agent_card_routes(card),
-    *create_jsonrpc_routes(handler, "/a2a"),
-])
+def create_app(state_dir: str | os.PathLike) -> Starlette:
+    runtime = Runtime(state_dir)
+    handler = DefaultRequestHandlerV2(
+        agent_executor=GraphExecutor(runtime), task_store=runtime.task_store, agent_card=card
+    )
+
+    @contextlib.asynccontextmanager
+    async def lifespan(_app):
+        await runtime.start()
+        try:
+            yield
+        finally:
+            await runtime.stop()
+
+    application = Starlette(
+        routes=[
+            Route("/healthz", health),
+            *create_agent_card_routes(card),
+            *create_jsonrpc_routes(handler, "/a2a"),
+        ],
+        lifespan=lifespan,
+    )
+    application.state.runtime = runtime
+    return application
+
+
+app = create_app(os.getenv("RE_LANGSTACK_STATE_DIR", "/data"))

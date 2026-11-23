@@ -48,8 +48,7 @@ curl http://127.0.0.1:8090/a2a \
 The agent accepts non-empty text parts, runs a LangGraph model node and returns
 a completed task with a text artifact, or a failed task if inference fails.
 JSON can be sent as text. Unsupported file/data parts are rejected rather than
-silently dropped. A2A streaming and task polling are supported by the SDK;
-tasks are held in memory and are lost on restart. The health endpoint indicates
+silently dropped. A2A streaming and task polling are supported by the SDK. The health endpoint indicates
 that the server is running, not that the model is available.
 
 Configure the RealityEngine A2A dispatcher to discover this card and consume
@@ -60,6 +59,26 @@ this service does not implement the legacy ACP completion callback or claim
 those unfinalized extensions. It does not expose a RealityEngine ingestion
 endpoint. PE-specific configuration and end-to-end ingestion must follow the
 final suite contract.
+
+## State
+
+Everything persists under `RE_LANGSTACK_STATE_DIR` (the `langstack-state`
+volume at `/data` in the container), so a restart loses nothing:
+
+- `tasks.sqlite`: A2A tasks (the SDK's `DatabaseTaskStore`);
+- `checkpoints.sqlite`: LangGraph checkpoints, one thread per frame
+  continuation (`langgraph-checkpoint-sqlite`);
+- `dispatches.sqlite`: which task holds each RealityEngine `dispatchId`.
+
+**Threads follow the resource model (#2).** A thread is the dispatch's
+context: the extension's `context.contextId` (RealityEngine_CI
+`docs/A2A_FRAMEWORK_SPEC.md` §4.5, a draft), never a context id this server
+minted. The workflow's context scope sets the thread's lifetime: one step
+(`frame`), the whole continuation through park and resume (`continuation`), or
+several frames (`span`). Without the extension, the A2A `contextId` is the
+thread. **A dispatch runs once:** a second request with the same `dispatchId`
+is rejected and names the task that holds it. The lifecycle service, not this
+state, remains the authority for continuations.
 
 ## Security
 

@@ -8,6 +8,9 @@ services:
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
       OLLAMA_MODEL: ${OLLAMA_MODEL:-nemotron-3-nano:4b-mlx}
       MODEL_TIMEOUT_SECONDS: ${MODEL_TIMEOUT_SECONDS:-120}
+      RE_LANGSTACK_STATE_DIR: /data
+    volumes:
+      - langstack-state:/data
     extra_hosts:
       - "host.docker.internal:host-gateway"
     healthcheck:
@@ -18,3 +21,6 @@ services:
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
+
+volumes:
+  langstack-state:

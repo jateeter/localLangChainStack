@@ -1,3 +1,4 @@
+import tempfile
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -5,17 +6,34 @@ import httpx
 
 import app
 
+EXT = app.RE_EXTENSION_URI
+
 
 class AgentTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.client = httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app.app), base_url="http://test"
-        )
+        self.state = tempfile.TemporaryDirectory()
+        await self.start()
+
+    async def start(self):
+        self.app = app.create_app(self.state.name)
+        self.runtime = self.app.state.runtime
+        await self.runtime.start()
+        self.client = httpx.AsyncClient(transport=httpx.ASGITransport(app=self.app), base_url="http://test")
+
+    async def stop(self):
+        await self.client.aclose()
+        await self.runtime.stop()
 
     async def asyncTearDown(self):
-        await self.client.aclose()
+        await self.stop()
+        self.state.cleanup()
 
-    async def send(self, parts, **configuration):
+    async def send(self, parts, metadata=None, context_id=None, **configuration):
+        message = {"messageId": "test", "role": "ROLE_USER", "parts": parts}
+        if metadata is not None:
+            message["metadata"] = metadata
+        if context_id is not None:
+            message["contextId"] = context_id
         return await self.client.post(
             "/a2a",
             headers={"A2A-Version": "1.0"},
@@ -23,30 +41,33 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 "jsonrpc": "2.0",
                 "id": 1,
                 "method": "SendMessage",
-                "params": {
-                    "message": {"messageId": "test", "role": "ROLE_USER", "parts": parts},
-                    "configuration": configuration,
-                },
+                "params": {"message": message, "configuration": configuration},
             },
         )
+
+    async def get_task(self, task_id):
+        response = await self.client.post(
+            "/a2a", headers={"A2A-Version": "1.0"},
+            json={"jsonrpc": "2.0", "id": 2, "method": "GetTask", "params": {"id": task_id}},
+        )
+        return response.json()["result"]
+
+    def stub_graph(self, **kwargs):
+        return patch.object(self.runtime.graph, "ainvoke", new=AsyncMock(**kwargs))
 
     async def test_card_and_completed_task(self):
         card = (await self.client.get("/.well-known/agent-card.json")).json()
         self.assertEqual(card["supportedInterfaces"][0]["protocolVersion"], "1.0")
-        with patch.object(app.graph, "ainvoke", new=AsyncMock(return_value={"response": "answer"})) as invoke:
-            response = await self.send([{"text": "question"}])
+        with self.stub_graph(return_value={"response": "answer"}) as invoke:
+            response = await self.send([{"text": "question"}], context_id="ctx-1")
         task = response.json()["result"]["task"]
         self.assertEqual(task["status"]["state"], "TASK_STATE_COMPLETED")
         self.assertEqual(task["artifacts"][0]["parts"][0]["text"], "answer")
-        invoke.assert_awaited_once_with({"prompt": "question"})
-        response = await self.client.post(
-            "/a2a", headers={"A2A-Version": "1.0"},
-            json={"jsonrpc": "2.0", "id": 2, "method": "GetTask", "params": {"id": task["id"]}},
-        )
-        self.assertEqual(response.json()["result"]["status"]["state"], "TASK_STATE_COMPLETED")
+        invoke.assert_awaited_once_with({"prompt": "question"}, {"configurable": {"thread_id": "ctx-1"}})
+        self.assertEqual((await self.get_task(task["id"]))["status"]["state"], "TASK_STATE_COMPLETED")
 
     async def test_failure_and_unsupported_input(self):
-        with patch.object(app.graph, "ainvoke", new=AsyncMock(side_effect=RuntimeError("model unavailable"))):
+        with self.stub_graph(side_effect=RuntimeError("model unavailable")):
             task = (await self.send([{"text": "question"}])).json()["result"]["task"]
         self.assertEqual(task["status"]["state"], "TASK_STATE_FAILED")
         task = (await self.send([{"url": "https://example.com/file"}])).json()["result"]["task"]
@@ -82,6 +103,44 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             json={"jsonrpc": "2.0", "id": 1, "method": "SendMessage", "params": {}},
         )
         self.assertIn("error", response.json())
+
+    async def test_thread_is_the_extension_context(self):
+        for scope_id in ("re:ctx:frame:asset-7:k2", "re:ctx:cont:asset-7:ifrs-approval-case", "re:ctx:span:s-1"):
+            metadata = {EXT: {"context": {"contextId": scope_id},
+                              "frame": {"assetId": "asset-7", "continuation": {"continuationId": "k2"}}}}
+            with self.stub_graph(return_value={"response": "ok"}) as invoke:
+                await self.send([{"text": "step"}], metadata=metadata, context_id="minted-elsewhere")
+            self.assertEqual(invoke.call_args.args[1], {"configurable": {"thread_id": scope_id}})
+
+    async def test_duplicate_dispatch_is_rejected_not_rerun(self):
+        metadata = {EXT: {"dispatch": {"dispatchId": "d-1"}}}
+        with self.stub_graph(return_value={"response": "ok"}) as invoke:
+            first = (await self.send([{"text": "q"}], metadata=metadata)).json()["result"]["task"]
+            second = (await self.send([{"text": "q"}], metadata=metadata)).json()["result"]["task"]
+        self.assertEqual(first["status"]["state"], "TASK_STATE_COMPLETED")
+        self.assertEqual(second["status"]["state"], "TASK_STATE_REJECTED")
+        self.assertIn(first["id"], second["status"]["message"]["parts"][0]["text"])
+        invoke.assert_awaited_once()
+
+    async def test_tasks_checkpoints_and_dispatches_survive_restart(self):
+        model = Mock()
+        model.ainvoke = AsyncMock(return_value=Mock(text="kept"))
+        metadata = {EXT: {"dispatch": {"dispatchId": "d-9"},
+                          "context": {"contextId": "re:ctx:frame:asset-1:k0"}}}
+        with patch.object(app, "ChatOllama", return_value=model):
+            task = (await self.send([{"text": "before restart"}], metadata=metadata)).json()["result"]["task"]
+        self.assertEqual(task["status"]["state"], "TASK_STATE_COMPLETED")
+
+        await self.stop()
+        await self.start()
+
+        self.assertEqual((await self.get_task(task["id"]))["status"]["state"], "TASK_STATE_COMPLETED")
+        state = await self.runtime.graph.aget_state({"configurable": {"thread_id": "re:ctx:frame:asset-1:k0"}})
+        self.assertEqual(state.values["response"], "kept")
+        with self.stub_graph(return_value={"response": "x"}) as invoke:
+            again = (await self.send([{"text": "q"}], metadata=metadata)).json()["result"]["task"]
+        self.assertEqual(again["status"]["state"], "TASK_STATE_REJECTED")
+        invoke.assert_not_awaited()
 
 
 if __name__ == "__main__":
