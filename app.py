@@ -33,11 +33,24 @@ class GraphState(TypedDict):
     response: str
 
 
-async def respond(state: GraphState) -> dict:
-    model = ChatOllama(
-        model=os.getenv("OLLAMA_MODEL", "llama3.2"),
+# The RealityEngine universe model: the MLX build of Nemotron 3 Nano 4B
+# (RealityEngine_CI CLAUDE.md). The plain ":4b" tag is the GGUF build on
+# llama.cpp and is not a substitute.
+UNIVERSE_MODEL = "nemotron-3-nano:4b-mlx"
+
+
+def chat_model() -> ChatOllama:
+    # Never pass `format` (JSON mode or a schema): Ollama's MLX runner refuses
+    # structured output for the nemotron-3-nano family (RealityEngine_CI
+    # docs/OLLAMA_INTEGRATION.md). Expected keys belong in the prompt.
+    return ChatOllama(
+        model=os.getenv("OLLAMA_MODEL", UNIVERSE_MODEL),
         base_url=os.getenv("OLLAMA_BASE_URL", "http://host.docker.internal:11434"),
     )
+
+
+async def respond(state: GraphState) -> dict:
+    model = chat_model()
     result = await model.ainvoke(state["prompt"])
     return {"response": result.text}
 
