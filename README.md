@@ -70,10 +70,12 @@ volume at `/data` in the container), so a restart loses nothing:
   continuation (`langgraph-checkpoint-sqlite`);
 - `dispatches.sqlite`: which task holds each RealityEngine `dispatchId`.
 
-**Threads follow the resource model (#2).** A frame step's thread is
-`<assetId>/<continuationId>`, read from the RealityEngine A2A extension
-(RealityEngine_CI `docs/A2A_FRAMEWORK_SPEC.md` §6, a draft), never from a
-context id the server minted. Without a frame, the A2A `contextId` is the
+**Threads follow the resource model (#2).** A thread is the dispatch's
+context: the extension's `context.contextId` (RealityEngine_CI
+`docs/A2A_FRAMEWORK_SPEC.md` §4.5, a draft), never a context id this server
+minted. The workflow's context scope sets the thread's lifetime: one step
+(`frame`), the whole continuation through park and resume (`continuation`), or
+several frames (`span`). Without the extension, the A2A `contextId` is the
 thread. **A dispatch runs once:** a second request with the same `dispatchId`
 is rejected and names the task that holds it. The lifecycle service, not this
 state, remains the authority for continuations.

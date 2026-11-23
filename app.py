@@ -87,17 +87,15 @@ def re_extension(context: RequestContext) -> dict:
 def thread_id_for(context: RequestContext) -> str:
     """The LangGraph thread for a request (the resource model, #2).
 
-    A frame step is keyed by the frame and its continuation, taken from the
-    extension, never from a context id the server minted. Without a frame
-    (an ordinary dispatch, or a manual request), the A2A context id is used;
-    a RealityEngine dispatcher always sends one (spec section 4.4).
+    The thread is the dispatch's context (spec section 4.5, owner 2026-11-23):
+    the workflow's context scope (frame, continuation, span or dispatch) sets
+    its lifetime, so one thread serves one step, travels with a continuation,
+    or spans frames, as configured. The id comes from the extension's
+    `context.contextId`, never from a context id this server minted. Without
+    the extension (a manual request), the A2A context id is used.
     """
-    frame = re_extension(context).get("frame") or {}
-    continuation = frame.get("continuation") or {}
-    asset_id, continuation_id = frame.get("assetId"), continuation.get("continuationId")
-    if asset_id and continuation_id:
-        return f"{asset_id}/{continuation_id}"
-    return context.context_id
+    context_id = (re_extension(context).get("context") or {}).get("contextId")
+    return context_id or context.context_id
 
 
 def dispatch_id_for(context: RequestContext) -> str | None:

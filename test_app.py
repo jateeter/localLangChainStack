@@ -104,11 +104,13 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("error", response.json())
 
-    async def test_frame_step_keys_thread_by_asset_and_continuation(self):
-        metadata = {EXT: {"frame": {"assetId": "asset-7", "continuation": {"continuationId": "k2"}}}}
-        with self.stub_graph(return_value={"response": "ok"}) as invoke:
-            await self.send([{"text": "step"}], metadata=metadata, context_id="minted-elsewhere")
-        self.assertEqual(invoke.call_args.args[1], {"configurable": {"thread_id": "asset-7/k2"}})
+    async def test_thread_is_the_extension_context(self):
+        for scope_id in ("re:ctx:frame:asset-7:k2", "re:ctx:cont:asset-7:ifrs-approval-case", "re:ctx:span:s-1"):
+            metadata = {EXT: {"context": {"contextId": scope_id},
+                              "frame": {"assetId": "asset-7", "continuation": {"continuationId": "k2"}}}}
+            with self.stub_graph(return_value={"response": "ok"}) as invoke:
+                await self.send([{"text": "step"}], metadata=metadata, context_id="minted-elsewhere")
+            self.assertEqual(invoke.call_args.args[1], {"configurable": {"thread_id": scope_id}})
 
     async def test_duplicate_dispatch_is_rejected_not_rerun(self):
         metadata = {EXT: {"dispatch": {"dispatchId": "d-1"}}}
@@ -124,7 +126,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         model = Mock()
         model.ainvoke = AsyncMock(return_value=Mock(text="kept"))
         metadata = {EXT: {"dispatch": {"dispatchId": "d-9"},
-                          "frame": {"assetId": "asset-1", "continuation": {"continuationId": "k0"}}}}
+                          "context": {"contextId": "re:ctx:frame:asset-1:k0"}}}
         with patch.object(app, "ChatOllama", return_value=model):
             task = (await self.send([{"text": "before restart"}], metadata=metadata)).json()["result"]["task"]
         self.assertEqual(task["status"]["state"], "TASK_STATE_COMPLETED")
@@ -133,7 +135,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         await self.start()
 
         self.assertEqual((await self.get_task(task["id"]))["status"]["state"], "TASK_STATE_COMPLETED")
-        state = await self.runtime.graph.aget_state({"configurable": {"thread_id": "asset-1/k0"}})
+        state = await self.runtime.graph.aget_state({"configurable": {"thread_id": "re:ctx:frame:asset-1:k0"}})
         self.assertEqual(state.values["response"], "kept")
         with self.stub_graph(return_value={"response": "x"}) as invoke:
             again = (await self.send([{"text": "q"}], metadata=metadata)).json()["result"]["task"]
