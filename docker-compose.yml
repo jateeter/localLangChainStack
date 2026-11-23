@@ -1,0 +1,20 @@
+services:
+  langgraph-agent:
+    build: .
+    ports:
+      - "127.0.0.1:${LANGSTACK_PORT:-8090}:8090"
+    environment:
+      A2A_PUBLIC_URL: ${A2A_PUBLIC_URL:-http://127.0.0.1:8090}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.2}
+      MODEL_TIMEOUT_SECONDS: ${MODEL_TIMEOUT_SECONDS:-120}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
