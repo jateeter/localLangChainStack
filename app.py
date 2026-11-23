@@ -72,7 +72,10 @@ graph = builder.compile()
 # The RealityEngine A2A extension (RealityEngine_CI docs/A2A_FRAMEWORK_SPEC.md
 # section 6, still a draft: CI#848). Only the members this service needs to key
 # its state are read here. Carrying the extension exactly is #6.
-RE_EXTENSION_URI = "urn:realityengine:a2a:ext:v0.1"
+# The extension's identifier is the URL of its published specification, pinned
+# to the version tag (spec section 6.1, owner 2026-11-23). It is a constant,
+# compared as a string, never fetched.
+RE_EXTENSION_URI = "https://github.com/jateeter/RealityEngine_CI/blob/re-a2a-v0.1/docs/A2A_FRAMEWORK_SPEC.md"
 
 
 def re_extension(context: RequestContext) -> dict:
