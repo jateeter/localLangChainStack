@@ -7,7 +7,11 @@ The deployment uses an existing Ollama server, as localOpenClawStack does.
 ## Start
 
 Requirements: Docker Engine, Docker Compose v2, and an Ollama server with a
-chat model installed (for example, `ollama pull llama3.2`).
+chat model installed. The default is the RealityEngine universe model,
+`nemotron-3-nano:4b-mlx` (`ollama pull nemotron-3-nano:4b-mlx`; Ollama 0.40.13
+or later). It is the MLX build: the plain `:4b` tag is GGUF on llama.cpp and is
+not a substitute. The agent never requests structured output (`format`), which
+Ollama's MLX runner refuses for this model family.
 
 ```sh
 cp .env.example .env

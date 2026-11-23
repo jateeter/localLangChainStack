@@ -6,7 +6,7 @@ services:
     environment:
       A2A_PUBLIC_URL: ${A2A_PUBLIC_URL:-http://127.0.0.1:8090}
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
-      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.2}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-nemotron-3-nano:4b-mlx}
       MODEL_TIMEOUT_SECONDS: ${MODEL_TIMEOUT_SECONDS:-120}
     extra_hosts:
       - "host.docker.internal:host-gateway"

@@ -60,6 +60,22 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["response"], "model response")
         model.ainvoke.assert_awaited_once_with("hello")
 
+    def test_defaults_to_universe_model_without_format(self):
+        with patch.dict(app.os.environ, {}, clear=False) as env:
+            env.pop("OLLAMA_MODEL", None)
+            with patch.object(app, "ChatOllama") as chat:
+                app.chat_model()
+        kwargs = chat.call_args.kwargs
+        self.assertEqual(kwargs["model"], "nemotron-3-nano:4b-mlx")
+        self.assertNotIn("format", kwargs)
+
+    def test_model_override_from_environment(self):
+        with patch.dict(app.os.environ, {"OLLAMA_MODEL": "other-model"}):
+            with patch.object(app, "ChatOllama") as chat:
+                app.chat_model()
+        self.assertEqual(chat.call_args.kwargs["model"], "other-model")
+        self.assertNotIn("format", chat.call_args.kwargs)
+
     async def test_unsupported_version(self):
         response = await self.client.post(
             "/a2a", headers={"A2A-Version": "9.0"},
