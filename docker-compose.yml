@@ -9,8 +9,11 @@ services:
       OLLAMA_MODEL: ${OLLAMA_MODEL:-nemotron-3-nano:4b-mlx}
       MODEL_TIMEOUT_SECONDS: ${MODEL_TIMEOUT_SECONDS:-120}
       RE_LANGSTACK_STATE_DIR: /data
+      RE_BEHAVIORS_DIR: /behaviors
     volumes:
       - langstack-state:/data
+      # Runtime-neutral agent behaviors (*.agent.json), read-only. Empty by default.
+      - ${RE_BEHAVIORS_HOST_DIR:-./behaviors}:/behaviors:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
     healthcheck:
