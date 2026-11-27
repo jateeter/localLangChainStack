@@ -6,7 +6,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt \
     && useradd --create-home --uid 10001 app \
     && mkdir -p /data && chown app:app /data
-COPY app.py .
+COPY app.py behaviors.py ./
 USER app
 # Tasks, LangGraph checkpoints and the dispatch index (RE_LANGSTACK_STATE_DIR).
 VOLUME ["/data"]

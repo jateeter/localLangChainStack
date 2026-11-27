@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import sqlite3
@@ -23,6 +24,7 @@ from a2a.types.a2a_pb2 import (
     TaskStatus,
 )
 from google.protobuf.json_format import MessageToDict
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_ollama import ChatOllama
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.graph import END, START, StateGraph
@@ -31,12 +33,16 @@ from starlette.applications import Starlette
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
+from behaviors import Behavior, load_behaviors
+
 logger = logging.getLogger(__name__)
 
 
-class GraphState(TypedDict):
+class GraphState(TypedDict, total=False):
     prompt: str
     response: str
+    # A behavior's system turn: its instructions and output contract (behaviors.py).
+    system: str
 
 
 # The RealityEngine universe model: the MLX build of Nemotron 3 Nano 4B
@@ -57,7 +63,11 @@ def chat_model() -> ChatOllama:
 
 async def respond(state: GraphState) -> dict:
     model = chat_model()
-    result = await model.ainvoke(state["prompt"])
+    system = state.get("system")
+    if system:
+        result = await model.ainvoke([SystemMessage(content=system), HumanMessage(content=state["prompt"])])
+    else:
+        result = await model.ainvoke(state["prompt"])
     return {"response": result.text}
 
 
@@ -103,6 +113,11 @@ def thread_id_for(context: RequestContext) -> str:
 
 def dispatch_id_for(context: RequestContext) -> str | None:
     return (re_extension(context).get("dispatch") or {}).get("dispatchId")
+
+
+def skill_for(context: RequestContext) -> str | None:
+    """The dispatch's skill id (spec section 6.3 `dispatch.skill`), which names a behavior."""
+    return (re_extension(context).get("dispatch") or {}).get("skill")
 
 
 class Runtime:
@@ -161,8 +176,9 @@ class Runtime:
 
 
 class GraphExecutor(AgentExecutor):
-    def __init__(self, runtime: Runtime):
+    def __init__(self, runtime: Runtime, behaviors: dict[str, Behavior] | None = None):
         self.runtime = runtime
+        self.behaviors = behaviors or {}
 
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
         task_id, context_id = context.task_id, context.context_id
@@ -182,6 +198,14 @@ class GraphExecutor(AgentExecutor):
         ) or not context.get_user_input().strip():
             await updater.reject(updater.new_agent_message([Part(text="Only non-empty text messages are supported.")]))
             return
+        skill = skill_for(context)
+        behavior = None
+        if skill:
+            behavior = self.behaviors.get(skill)
+            refusal = f"Unknown skill {skill}." if behavior is None else behavior.refusal
+            if refusal:
+                await updater.reject(updater.new_agent_message([Part(text=refusal)]))
+                return
         dispatch_id = dispatch_id_for(context)
         if dispatch_id:
             holder = self.runtime.claim_dispatch(dispatch_id, task_id)
@@ -192,15 +216,21 @@ class GraphExecutor(AgentExecutor):
                 )
                 return
         await updater.start_work()
+        state = {"prompt": context.get_user_input()}
+        if behavior is not None:
+            state["system"] = behavior.system_prompt()
         try:
             result = await asyncio.wait_for(
                 self.runtime.graph.ainvoke(
-                    {"prompt": context.get_user_input()},
+                    state,
                     {"configurable": {"thread_id": thread_id_for(context)}},
                 ),
                 timeout=float(os.getenv("MODEL_TIMEOUT_SECONDS", "120")),
             )
             await updater.add_artifact([Part(text=result["response"])], name="response")
+            if behavior is not None:
+                completion = {"behaviorId": behavior.behavior_id, **behavior.parse_completion(result["response"])}
+                await updater.add_artifact([Part(text=json.dumps(completion, sort_keys=True))], name="completion")
             await updater.complete()
         except Exception:
             logger.exception("Agent execution failed")
@@ -211,26 +241,44 @@ class GraphExecutor(AgentExecutor):
 
 
 public_url = os.getenv("A2A_PUBLIC_URL", "http://127.0.0.1:8090").rstrip("/")
-card = AgentCard(
-    name="Local LangGraph Agent",
-    description="A local LangGraph agent backed by an Ollama chat model.",
-    version="0.1.0",
-    supported_interfaces=[
-        AgentInterface(url=f"{public_url}/a2a", protocol_binding="JSONRPC", protocol_version="1.0")
-    ],
-    capabilities=AgentCapabilities(streaming=True),
-    default_input_modes=["text/plain"],
-    default_output_modes=["text/plain"],
-    skills=[AgentSkill(id="respond", name="Respond", description="Respond to a text message.", tags=["chat"])],
-)
+
+
+def behavior_skill(b: Behavior) -> AgentSkill:
+    tags = [t for t in (b.domain, b.role, b.workflow) if t]
+    description = b.objective if b.refusal is None else f"{b.objective} (not run here: {b.refusal})"
+    return AgentSkill(id=b.behavior_id, name=b.display_name, description=description, tags=tags)
+
+
+def build_card(behaviors: dict[str, Behavior]) -> AgentCard:
+    """The Agent Card: the generic `respond` skill, and one skill per loaded behavior."""
+    return AgentCard(
+        name="Local LangGraph Agent",
+        description="A local LangGraph agent backed by an Ollama chat model.",
+        version="0.1.0",
+        supported_interfaces=[
+            AgentInterface(url=f"{public_url}/a2a", protocol_binding="JSONRPC", protocol_version="1.0")
+        ],
+        capabilities=AgentCapabilities(streaming=True),
+        default_input_modes=["text/plain"],
+        default_output_modes=["text/plain"],
+        skills=[AgentSkill(id="respond", name="Respond", description="Respond to a text message.", tags=["chat"]),
+                *(behavior_skill(b) for b in behaviors.values())],
+    )
+
+
+card = build_card({})
 async def health(request):
     return JSONResponse({"status": "ok"})
 
 
-def create_app(state_dir: str | os.PathLike) -> Starlette:
+def create_app(state_dir: str | os.PathLike, behaviors_dir: str | os.PathLike | None = None) -> Starlette:
+    """The service. `behaviors_dir` holds runtime-neutral behaviors (`*.agent.json`,
+    RE_BEHAVIORS_DIR); each is a skill on the card and runs when a dispatch names it."""
     runtime = Runtime(state_dir)
+    behaviors = load_behaviors(behaviors_dir)
+    app_card = build_card(behaviors)
     handler = DefaultRequestHandlerV2(
-        agent_executor=GraphExecutor(runtime), task_store=runtime.task_store, agent_card=card
+        agent_executor=GraphExecutor(runtime, behaviors), task_store=runtime.task_store, agent_card=app_card
     )
 
     @contextlib.asynccontextmanager
@@ -244,13 +292,14 @@ def create_app(state_dir: str | os.PathLike) -> Starlette:
     application = Starlette(
         routes=[
             Route("/healthz", health),
-            *create_agent_card_routes(card),
+            *create_agent_card_routes(app_card),
             *create_jsonrpc_routes(handler, "/a2a"),
         ],
         lifespan=lifespan,
     )
     application.state.runtime = runtime
+    application.state.behaviors = behaviors
     return application
 
 
-app = create_app(os.getenv("RE_LANGSTACK_STATE_DIR", "/data"))
+app = create_app(os.getenv("RE_LANGSTACK_STATE_DIR", "/data"), os.getenv("RE_BEHAVIORS_DIR") or None)

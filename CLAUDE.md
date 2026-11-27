@@ -38,13 +38,15 @@ The masters are in RealityEngine_CI. Follow them, not this file, when they diffe
 ## Codebase Map
 
 - `app.py`: the LangGraph graph, the A2A executor, the Agent Card, and the Starlette app (`/healthz`, `/.well-known/agent-card.json`, `/a2a` JSON-RPC).
+- `behaviors.py`: runtime-neutral agent behaviors (RealityEngine_Machines `schemas/agent-behavior.schema.json`) rendered for A2A, at the template level of #3. Each is a card skill; `dispatch.skill` selects it; the reply's completion fields are parsed into a `completion` artifact. `deterministic-tool` behaviors are refused.
+- `test_behaviors.py`: behavior tests, including loading the 16 ai-governance-regime behaviors when RealityEngine_Machines is beside this checkout.
 - `test_app.py`: unit tests. Inference is stubbed, and no Ollama is needed.
 - `Dockerfile`, `docker-compose.yml`, `.env.example`: the local container.
 
 ## Key Commands
 
 ```bash
-python -m unittest -v test_app       # with requirements.txt (and httpx) installed
+python -m unittest -v test_app test_behaviors   # with requirements.txt (and httpx) installed
 docker compose config
 docker compose up --build -d
 curl -s http://127.0.0.1:8090/.well-known/agent-card.json

@@ -60,6 +60,31 @@ those unfinalized extensions. It does not expose a RealityEngine ingestion
 endpoint. PE-specific configuration and end-to-end ingestion must follow the
 final suite contract.
 
+## Behaviors
+
+The service also renders RealityEngine's **runtime-neutral agent behaviors**
+(RealityEngine_Machines `schemas/agent-behavior.schema.json`) for A2A. This is
+the template level of the assistant registry (#3).
+
+- **Loading.** Every `*.agent.json` in `RE_BEHAVIORS_DIR` loads at start: `/behaviors` in the
+  container, mounted read-only from `RE_BEHAVIORS_HOST_DIR`, default `./behaviors`, which is empty. For
+  example, the ai-governance-regime agents:
+  `RE_BEHAVIORS_HOST_DIR=../RealityEngine_Machines/machine_factory/domains/ai-governance-regime/agent-candidates/ai-governance-regime`.
+- **Discovery.** Each behavior is a **skill** on the Agent Card, with the behavior id as the skill id.
+- **Dispatch.** A request whose RealityEngine extension names `dispatch.skill` runs that behavior.
+  Its instructions and output contract are the system turn, and the message text is the user turn.
+  An unknown skill is rejected.
+- **Completion.** The task returns the text artifact `response` and an artifact `completion`.
+  `completion` is JSON: `behaviorId`, `fields`, `rationale` and `complete`. `fields` holds the
+  behavior's `responseMapping` fields, parsed from the reply's `<field>: <value>` lines. A field the
+  reply does not state is `null`, never guessed. Nothing is written back from here; ingress is the
+  engine's commit gate.
+- **Refused, not imitated:** a `deterministic-tool` behavior, whose result must come from a tool,
+  and a behavior that names no completion field. Of the 16 governance behaviors, 15 run here; the
+  diff renderer is refused, because the canonical diff is Manager's.
+- **Capabilities are declared, not granted.** This service holds no lifecycle credential and has no
+  tools. Frame-scoped tools are #5.
+
 ## State
 
 Everything persists under `RE_LANGSTACK_STATE_DIR` (the `langstack-state`
